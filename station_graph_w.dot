@@ -1,0 +1,21 @@
+digraph G {
+    "Aldgate" -> "Blackfriars" [label="63",weight="63"];
+    "Aldgate" -> "Farringdon" [label="2028",weight="2028"];
+    "Aldgate" -> "Liverpool Street" [label="1048",weight="1048"];
+    "Aldgate" -> "Old Street" [label="7",weight="7"];
+    "Blackfriars" -> "Aldgate" [label="72",weight="72"];
+    "Blackfriars" -> "Liverpool Street" [label="560",weight="560"];
+    "Blackfriars" -> "Old Street" [label="1",weight="1"];
+    "Farringdon" -> "Aldgate" [label="1604",weight="1604"];
+    "Farringdon" -> "Liverpool Street" [label="4881",weight="4881"];
+    "Farringdon" -> "Old Street" [label="15",weight="15"];
+    "Liverpool Street" -> "Aldgate" [label="731",weight="731"];
+    "Liverpool Street" -> "Blackfriars" [label="729",weight="729"];
+    "Liverpool Street" -> "Farringdon" [label="4497",weight="4497"];
+    "Liverpool Street" -> "Old Street" [label="432",weight="432"];
+    "Old Street" -> "Aldgate" [label="33",weight="33"];
+    "Old Street" -> "Blackfriars" [label="132",weight="132"];
+    "Old Street" -> "Farringdon" [label="24",weight="24"];
+    "Old Street" -> "Liverpool Street" [label="108",weight="108"];
+
+}

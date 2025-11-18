@@ -1,11 +1,19 @@
 import re
+import subprocess
 
 # Change these values as needed
 input_file = 'OD_matrix_2017.csv'
-output_file = 'station_graph.dot'
-
+output_file = 'station_graph_w.dot'
+REDUCE_ZONE_ONE = True
+RENDER_STYLE = 2  # 0 for record, 1 for bidirectional edges, 2 for double edges
 
 zone_one_stations = [
+    "Aldgate",
+    "Blackfriars",
+    "Farringdon",
+    "liverpool Street",
+    "Old Street",
+] if REDUCE_ZONE_ONE else [
     "Aldgate",
     "Aldgate East",
     "Angel",
@@ -92,11 +100,50 @@ regex = re.compile(full_pattern, re.IGNORECASE)
 
 
 regex = re.compile(full_pattern, re.IGNORECASE)
-with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
-    outfile.write('digraph G {\n')
-    for line in infile:
-        if regex.match(line):
-            separated = line.strip().split(',')
 
-            outfile.write(f'    "{separated[1]}" -> "{separated[3]}"[label="{separated[10]}",weight="{separated[10]}"];\n')
-    outfile.write('}\n')
+if RENDER_STYLE == 0:
+#For record shape with in on left and out on right:
+    with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write('digraph G {\nnode [shape=record];\n')
+        nodeset = set()
+        for line in infile:
+            if regex.match(line):
+                separated = line.strip().split(',')
+                if separated[1] not in nodeset:
+                    outfile.write(f'"{separated[1].strip()}"[label="{{<l> | {separated[1]} | <r>}}"];\n')
+                    nodeset.add(separated[1])
+                if separated[3] not in nodeset:
+                    outfile.write(f'"{separated[3].strip()}"[label="{{<l> | {separated[3]} | <r>}}"];\n')
+                    nodeset.add(separated[3])
+                outfile.write(f'    "{separated[1].strip()}":r -> "{separated[3].strip()}":l [label="{separated[10]}",weight="{separated[10]}"];\n')
+        outfile.write('rankdir=LR;\nranksep=2;\n}\n')
+elif RENDER_STYLE == 1:
+    with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write('digraph G {\n')
+        dirs = []
+        for line in infile:
+            if regex.match(line):
+                separated = line.strip().split(',')
+                dirs.append((separated[1].strip(), separated[3].strip(), separated[10]))
+        while dirs.__len__() > 0:
+           
+            current = dirs.pop()
+            opposite = next((d for d in dirs if d[0] == current[1] and d[1] == current[0]), None)
+            if opposite:
+                dirs.remove(opposite)
+                outfile.write(f'    "{current[0].strip()}" -> "{current[1].strip()}" [dir="both",labeldistance=4,headlabel="{current[2]}",taillabel="{opposite[2]}",weight="{float(current[2]) + float(opposite[2])}"];\n')
+            else:
+                outfile.write(f'    "{current[0].strip()}" -> "{current[1].strip()}" [label="{current[2]}",weight="{current[2]}"];\n')
+        # outfile.write('graph [sep="+0.4"];\n}\n')
+        outfile.write('rankdir=LR;\nnodesep=0.6;\n}\n')
+elif RENDER_STYLE == 2:
+    with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
+        outfile.write('digraph G {\n')
+        for line in infile:
+            if regex.match(line):
+                separated = line.strip().split(',')
+                outfile.write(f'    "{separated[1].strip()}" -> "{separated[3].strip()}" [label="{separated[10]}",weight="{separated[10]}"];\n')
+        outfile.write('\n}\n')
+else:
+    print("Invalid RENDER_STYLE selected.")
+subprocess.run(['dot', '-Tsvg', output_file, '-o', 'station_graph_w.svg'])

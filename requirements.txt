@@ -1,0 +1,2 @@
+deap>=1.4.1
+matplotlib>=3.8
