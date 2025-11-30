@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from typing import Dict, Sequence, Tuple
+import torch
 
 # Coordinates are intentionally schematic (not geographic) to resemble a tube-style map.
 # X increases eastward, Y increases northward.
@@ -90,6 +91,26 @@ STATION_LAYOUT: Dict[str, Tuple[float, float]] = {
     "Mile End": (3.5, 0.2),
 }
 
+# Preserve the same ordering as the literal above
+STATION_ORDER: Tuple[str, ...] = tuple(STATION_LAYOUT.keys())
+
+_n = len(STATION_ORDER)
+_dist_matrix = [[0.0] * _n for _ in range(_n)]
+for i, a in enumerate(STATION_ORDER):
+    xa, ya = STATION_LAYOUT[a]
+    for j, b in enumerate(STATION_ORDER):
+        if i == j:
+            _dist_matrix[i][j] = 0.0
+            continue
+        xb, yb = STATION_LAYOUT[b]
+        # Euclidean distance in schematic units, scaled to meters
+        _dist_matrix[i][j] = math.hypot(xa - xb, ya - yb)
+
+# Exported constant: float32 PyTorch tensor of shape (N, N)
+# DEVICE = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+DEVICE = "cpu"
+STATION_DISTANCES = torch.tensor(_dist_matrix, dtype=torch.float32, device=DEVICE)
+
 
 def build_layout(stations: Sequence[str]) -> Dict[str, Tuple[float, float]]:
     """Return coordinates for every requested station, fabricating a grid for unknown names."""
@@ -148,3 +169,4 @@ def enforce_min_spacing(
             break
 
     return {name: (pos[0], pos[1]) for name, pos in coords.items()}
+

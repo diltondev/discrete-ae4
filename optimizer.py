@@ -5,7 +5,7 @@ This module wires together:
 * Domain data structures for stations, tube lines, and passenger demand pairs
 * Helper utilities for generating, mutating, and mating individuals under
   a strict cost-per-connection budget
-* An evaluation function that scores networks with a BFS-based travel cost
+* An evaluation function that scores networks via tensorized demand-distance products
 
 Running this file directly will execute a small evolutionary search using the
 `filtered_OD.csv` matrix bundled with the repository.
@@ -18,24 +18,33 @@ import csv
 import math
 import random
 import statistics
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib import patches as mpatches
 from matplotlib.path import Path as MplPath
 from deap import algorithms, base, creator, tools
+import torch
+import numpy as np
+from collections import deque
 
-from station_layout import build_layout
 
-COST_PER_CONNECTION_DEFAULT = 1
-MAX_COST_DEFAULT = 1000
+
+from station_layout import build_layout, STATION_DISTANCES, STATION_ORDER, DEVICE
+
+STATION_INDEX = {name: idx for idx, name in enumerate(STATION_ORDER)}
+STATION_DISTANCES_CPU = STATION_DISTANCES.detach().cpu()
+
+COST_PER_CONNECTION_DEFAULT = 3
+MAX_COST_DEFAULT = 10000000
 MAX_LINE_LENGTH = 7  # maximum stations allowed within a single synthetic line
 MAX_NUMBER_LINES = 11  # maximum number of lines allowed per individual
 DISCONNECT_MULTIPLIER = 10000  # penalty multiplier when no route exists
+DISTANCE_SCALAR_EPS = 1e-4
 
 # Rendering constants
 LINE_WIDTH_PT = 5.0
@@ -74,54 +83,11 @@ class TubeLine:
 		return TubeLine(name=f"{self.name}{suffix}", stations=list(self.stations))
 
 
-@dataclass(frozen=True)
-class DemandPair:
-	"""Aggregate travel demand between two stations."""
-
-	origin: str
-	destination: str
-	total_trips: int
-
-
-class StationGraph:
-	"""Undirected graph with BFS shortest-path utilities."""
-
-	def __init__(self, station_names: Iterable[str]):
-		self._adjacency: Dict[str, set[str]] = {name: set() for name in station_names}
-
-	def add_connection(self, a: str, b: str) -> None:
-		if a == b:
-			return
-		if a not in self._adjacency:
-			self._adjacency[a] = set()
-		if b not in self._adjacency:
-			self._adjacency[b] = set()
-		self._adjacency[a].add(b)
-		self._adjacency[b].add(a)
-
-	def shortest_station_count(self, start: str, goal: str) -> int | None:
-		if start not in self._adjacency or goal not in self._adjacency:
-			return None
-		if start == goal:
-			return 1
-		visited = {start}
-		queue = deque([(start, 1)])
-		while queue:
-			node, depth = queue.popleft()
-			for neighbor in self._adjacency.get(node, []):
-				if neighbor == goal:
-					return depth + 1
-				if neighbor not in visited:
-					visited.add(neighbor)
-					queue.append((neighbor, depth + 1))
-		return None
-
-
-def load_station_demands(csv_path: Path) -> Tuple[Dict[str, Station], List[DemandPair]]:
-	"""Parse the filtered OD matrix and aggregate undirected demand pairs."""
+def load_station_demands(csv_path: Path) -> Tuple[Dict[str, Station], torch.Tensor]:
+	"""Parse the filtered OD matrix and build a symmetric OD demand tensor."""
 
 	stations: Dict[str, Station] = {}
-	pair_totals: Dict[Tuple[str, str], int] = {}
+	demand_tensor = torch.zeros_like(STATION_DISTANCES, device=DEVICE)
 
 	with csv_path.open(newline="", encoding="utf-8") as handle:
 		reader = csv.reader(handle)
@@ -140,14 +106,18 @@ def load_station_demands(csv_path: Path) -> Tuple[Dict[str, Station], List[Deman
 			if origin_name == dest_name:
 				continue
 
+			origin_idx = STATION_INDEX.get(origin_name)
+			dest_idx = STATION_INDEX.get(dest_name)
+			if origin_idx is None or dest_idx is None:
+				continue
+
 			stations.setdefault(origin_name, Station(origin_code, origin_name))
 			stations.setdefault(dest_name, Station(dest_code, dest_name))
 
-			key = tuple(sorted((origin_name, dest_name)))
-			pair_totals[key] = pair_totals.get(key, 0) + total
+			demand_tensor[origin_idx, dest_idx] += total
+			demand_tensor[dest_idx, origin_idx] += total
 
-	demands = [DemandPair(origin=a, destination=b, total_trips=total) for (a, b), total in pair_totals.items()]
-	return stations, demands
+	return stations, demand_tensor
 
 
 line_counter = count(1)
@@ -161,8 +131,25 @@ def total_connections(lines: Sequence[TubeLine]) -> int:
 	return sum(line.connections for line in lines)
 
 
-def remaining_capacity(lines: Sequence[TubeLine], max_connections: int) -> int:
-	return max(0, max_connections - total_connections(lines))
+def connection_cost(a: str, b: str, cost_per_connection: float) -> float:
+	idx_a = STATION_INDEX.get(a)
+	idx_b = STATION_INDEX.get(b)
+	if idx_a is None or idx_b is None:
+		return 0.0
+	distance = float(STATION_DISTANCES_CPU[idx_a, idx_b].item())
+	return  cost_per_connection * (distance ** 2)
+
+
+def total_connection_cost(lines: Sequence[TubeLine], cost_per_connection: float) -> float:
+	total = 0.0
+	for line in lines:
+		for a, b in line.edges():
+			total += connection_cost(a, b, cost_per_connection)
+	return total
+
+
+def remaining_budget(lines: Sequence[TubeLine], max_cost: float, cost_per_connection: float) -> float:
+	return max(0.0, max_cost - total_connection_cost(lines, cost_per_connection))
 
 
 def build_random_line(station_names: Sequence[str], max_segments: int) -> TubeLine:
@@ -171,8 +158,8 @@ def build_random_line(station_names: Sequence[str], max_segments: int) -> TubeLi
 	return TubeLine(name=next_line_name(), stations=list(chosen))
 
 
-def enforce_budget(lines: List[TubeLine], max_connections: int) -> None:
-	while lines and total_connections(lines) > max_connections:
+def enforce_budget(lines: List[TubeLine], max_cost: float, cost_per_connection: float) -> None:
+	while lines and total_connection_cost(lines, cost_per_connection) > max_cost:
 		victim = random.choice(lines)
 		if victim.connections <= 1:
 			lines.remove(victim)
@@ -202,30 +189,32 @@ def mutate_line(line: TubeLine, station_names: Sequence[str]) -> None:
 		line.stations[idx] = candidate
 
 
-def init_individual(icls, station_names: Sequence[str], max_connections: int):
+def init_individual(icls, station_names: Sequence[str], max_cost: float, cost_per_connection: float):
 	lines: List[TubeLine] = []
-	capacity = max_connections
+	max_segments = max(2, min(MAX_LINE_LENGTH, len(station_names)))
+	if max_segments < 2:
+		raise RuntimeError("Not enough stations to seed an individual")
 
-	while capacity > 0 and len(lines) < MAX_NUMBER_LINES:
-		max_segments = min(MAX_LINE_LENGTH, capacity + 1, len(station_names))
-		if max_segments < 2:
-			break
+	while len(lines) < MAX_NUMBER_LINES:
 		line = build_random_line(station_names, max_segments)
 		lines.append(line)
-		capacity -= line.connections
-		if capacity <= 0 or random.random() < 0.25:
+		enforce_budget(lines, max_cost, cost_per_connection)
+		if remaining_budget(lines, max_cost, cost_per_connection) <= 0 or random.random() < 0.25:
 			break
 
 	if not lines:
-		# Fallback to at least one line
-		lines.append(build_random_line(station_names, min(2, MAX_LINE_LENGTH)))
+		line = build_random_line(station_names, 2)
+		lines.append(line)
+		enforce_budget(lines, max_cost, cost_per_connection)
+		if not lines:
+			raise RuntimeError("Unable to initialize an individual within the budget constraints")
 
 	enforce_line_limit(lines, MAX_NUMBER_LINES)
 
 	return icls(lines)
 
 
-def mate_individual(ind1, ind2, max_connections: int):
+def mate_individual(ind1, ind2, max_cost: float, cost_per_connection: float):
 	if not ind1 or not ind2:
 		return ind1, ind2
 
@@ -238,15 +227,21 @@ def mate_individual(ind1, ind2, max_connections: int):
 	ind1[:] = child1
 	ind2[:] = child2
 
-	enforce_budget(ind1, max_connections)
-	enforce_budget(ind2, max_connections)
+	enforce_budget(ind1, max_cost, cost_per_connection)
+	enforce_budget(ind2, max_cost, cost_per_connection)
 	enforce_line_limit(ind1, MAX_NUMBER_LINES)
 	enforce_line_limit(ind2, MAX_NUMBER_LINES)
 
 	return ind1, ind2
 
 
-def mutate_individual(individual, station_names: Sequence[str], max_connections: int, indpb: float = 0.2):
+def mutate_individual(
+	individual,
+	station_names: Sequence[str],
+	max_cost: float,
+	cost_per_connection: float,
+	indpb: float = 0.2,
+):
 	for line in list(individual):
 		if random.random() < indpb:
 			mutate_line(line, station_names)
@@ -256,34 +251,78 @@ def mutate_individual(individual, station_names: Sequence[str], max_connections:
 	if individual and random.random() < 0.2:
 		individual.pop(random.randrange(len(individual)))
 
-	if (
-		len(individual) < MAX_NUMBER_LINES
-		and remaining_capacity(individual, max_connections) > 0
-		and random.random() < 0.6
-	):
-		max_segments = min(MAX_LINE_LENGTH, remaining_capacity(individual, max_connections) + 1, len(station_names))
+	remaining = remaining_budget(individual, max_cost, cost_per_connection)
+	if len(individual) < MAX_NUMBER_LINES and remaining > 0 and random.random() < 0.6:
+		max_segments = min(MAX_LINE_LENGTH, len(station_names))
 		if max_segments >= 2:
 			individual.append(build_random_line(station_names, max_segments))
 
-	enforce_budget(individual, max_connections)
+	enforce_budget(individual, max_cost, cost_per_connection)
 	enforce_line_limit(individual, MAX_NUMBER_LINES)
 	return (individual,)
 
-
-def evaluate_network(individual: Sequence[TubeLine], demands: Sequence[DemandPair], station_names: Sequence[str]):
-	graph = StationGraph(station_names)
+### Builds a copy of station distances where only connected lines are represented as fractions
+### For n lines connecting a and b stations, the output tensor will have 1/n in (a,b) and (b,a)
+def build_connectivity_tensor(individual: Sequence[TubeLine]) -> torch.Tensor:
+	scalar = torch.zeros_like(STATION_DISTANCES, device=DEVICE)
 	for line in individual:
 		for a, b in line.edges():
-			graph.add_connection(a, b)
+			idx_a = STATION_INDEX.get(a)
+			idx_b = STATION_INDEX.get(b)
+			if idx_a is None or idx_b is None:
+				continue
+			scalar[idx_a, idx_b] += 1
+			scalar[idx_b, idx_a] += 1
+	scalar = scalar.reciprocal()
+	return scalar
 
-	missing_penalty = DISCONNECT_MULTIPLIER
-	score = 0
-	for pair in demands:
-		path_len = graph.shortest_station_count(pair.origin, pair.destination)
-		if path_len is None:
-			score += pair.total_trips * missing_penalty
-		else:
-			score += (pair.total_trips * path_len)
+### Determines minimum path based on scaled distance using D'Esopo-Pape Algorithm
+def build_commute_distance_tensor(individual: Sequence[TubeLine]) -> torch.Tensor:
+	connectivity = build_connectivity_tensor(individual)
+	scaled_connectivity = connectivity * STATION_DISTANCES
+	paths = torch.full_like(scaled_connectivity, float(DISCONNECT_MULTIPLIER), device=DEVICE)
+
+	for r, origin in enumerate(paths):
+		distance = [float("inf")] * len(origin)
+		distance[r] = 0
+		in_queue = [False] * len(origin)
+		queue = deque()
+		in_queue[r] = True
+		queue.append(r)
+		while queue:
+			a = queue.popleft()
+			in_queue[a] = False
+			for b, destination in enumerate(scaled_connectivity[a]):
+				if distance[b] > destination + distance[a]:
+					distance[b] = destination + distance[a]
+					if not in_queue[b]:
+						in_queue[b] = True
+						if not queue or distance[b] > distance[queue[0]]:
+							queue.append(b)
+						else:
+							queue.appendleft(b)
+		for i, d in enumerate(distance):
+			if not math.isinf(d):
+				paths[r, i] = d
+	# np.savetxt("tensor.csv", paths.cpu().numpy(), delimiter=",")
+	return paths
+
+					
+			
+
+
+
+
+def evaluate_network(individual: Sequence[TubeLine], demand_tensor: torch.Tensor):
+	score_tensor = build_commute_distance_tensor(individual) * demand_tensor
+
+
+	# np.savetxt("station_distances.csv", STATION_DISTANCES.cpu().numpy(), delimiter=",", fmt="%.6f")
+	# np.savetxt("distance_scalar.csv", distance_scalar.cpu().numpy(), delimiter=",", fmt="%.6f")
+	# np.savetxt("demand_tensor.csv", demand_tensor.cpu().numpy(), delimiter=",", fmt="%.6f")
+	score = score_tensor.sum().item()
+	if not math.isfinite(score):
+		score = float("inf")
 	return (score,)
 
 
@@ -292,12 +331,13 @@ def configure_toolbox(
 	cost_per_connection: int,
 	max_cost: int,
 ):
-	stations, demands = load_station_demands(data_path)
+	stations, demand_tensor = load_station_demands(data_path)
 	if not stations:
 		raise RuntimeError("No stations found in the supplied matrix")
 
-	station_names = tuple(stations.keys())
-	max_connections = max(1, max_cost // cost_per_connection)
+	station_names = tuple(sorted(stations.keys(), key=lambda name: STATION_INDEX[name]))
+	max_cost = float(max_cost)
+	cost_per_connection = float(cost_per_connection)
 
 	if "FitnessMin" not in creator.__dict__:
 		creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
@@ -305,20 +345,28 @@ def configure_toolbox(
 		creator.create("Individual", list, fitness=creator.FitnessMin)
 
 	toolbox = base.Toolbox()
-	toolbox.register("individual", init_individual, creator.Individual, station_names, max_connections)
+	toolbox.register(
+		"individual",
+		init_individual,
+		creator.Individual,
+		station_names,
+		max_cost,
+		cost_per_connection,
+	)
 	toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-	toolbox.register("mate", mate_individual, max_connections=max_connections)
+	toolbox.register("mate", mate_individual, max_cost=max_cost, cost_per_connection=cost_per_connection)
 	toolbox.register(
 		"mutate",
 		mutate_individual,
 		station_names=station_names,
-		max_connections=max_connections,
+		max_cost=max_cost,
+		cost_per_connection=cost_per_connection,
 		indpb=0.25,
 	)
 	toolbox.register("select", tools.selTournament, tournsize=3)
-	toolbox.register("evaluate", evaluate_network, demands=demands, station_names=station_names)
+	toolbox.register("evaluate", evaluate_network, demand_tensor=demand_tensor)
 
-	return toolbox, demands, station_names, max_connections
+	return toolbox, station_names
 
 
 def run_algorithm(
@@ -336,7 +384,7 @@ def run_algorithm(
 	if seed is not None:
 		random.seed(seed)
 
-	toolbox, demands, station_names, max_connections = configure_toolbox(
+	toolbox, station_names = configure_toolbox(
 		data_path=data_path,
 		cost_per_connection=cost_per_connection,
 		max_cost=max_cost,
