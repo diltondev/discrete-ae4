@@ -118,6 +118,7 @@ if RENDER_STYLE == 0:
                 outfile.write(f'    "{separated[1].strip()}":r -> "{separated[3].strip()}":l [label="{separated[10]}",weight="{separated[10]}"];\n')
         outfile.write('rankdir=LR;\nranksep=2;\n}\n')
 elif RENDER_STYLE == 1:
+    # For bidirectional edges with wetights on both sides of edge
     with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
         outfile.write('digraph G {\n')
         dirs = []
@@ -137,6 +138,7 @@ elif RENDER_STYLE == 1:
         # outfile.write('graph [sep="+0.4"];\n}\n')
         outfile.write('rankdir=LR;\nnodesep=0.6;\n}\n')
 elif RENDER_STYLE == 2:
+    # For regular directed edges, one for each direction
     with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
         outfile.write('digraph G {\n')
         for line in infile:
@@ -144,6 +146,13 @@ elif RENDER_STYLE == 2:
                 separated = line.strip().split(',')
                 outfile.write(f'    "{separated[1].strip()}" -> "{separated[3].strip()}" [label="{separated[10]}",weight="{separated[10]}"];\n')
         outfile.write('\n}\n')
+elif RENDER_STYLE == 3:
+    # For writing filtered OD matrix to CSV
+    with open(input_file, 'r', encoding='utf-8') as infile, open(output_file, 'w', encoding='utf-8') as outfile:
+        for line in infile:
+            if regex.match(line):
+                outfile.write(line)
 else:
     print("Invalid RENDER_STYLE selected.")
-subprocess.run(['dot', '-Tsvg', output_file, '-o', 'station_graph_w.svg'])
+if not RENDER_STYLE == 3: 
+    subprocess.run(['dot', '-Tsvg', output_file, '-o', 'station_graph_w.svg'])

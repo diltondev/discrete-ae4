@@ -28,22 +28,21 @@ import matplotlib.pyplot as plt
 from matplotlib import patches as mpatches
 from matplotlib.path import Path as MplPath
 from deap import algorithms, base, creator, tools
-import torch
 import numpy as np
 from collections import deque
 
 
 
-from station_layout import build_layout, STATION_DISTANCES, STATION_ORDER, DEVICE
+from station_layout import build_layout, STATION_DISTANCES, STATION_ORDER
 
 STATION_INDEX = {name: idx for idx, name in enumerate(STATION_ORDER)}
-STATION_DISTANCES_CPU = STATION_DISTANCES.detach().cpu()
+STATION_DISTANCES_CPU = STATION_DISTANCES.copy()
 
 COST_PER_CONNECTION_DEFAULT = 3
-MAX_COST_DEFAULT = 10000000
+MAX_COST_DEFAULT = 1000
 MAX_LINE_LENGTH = 7  # maximum stations allowed within a single synthetic line
 MAX_NUMBER_LINES = 11  # maximum number of lines allowed per individual
-DISCONNECT_MULTIPLIER = 10000  # penalty multiplier when no route exists
+DISCONNECT_MULTIPLIER = 5000  # penalty multiplier when no route exists
 DISTANCE_SCALAR_EPS = 1e-4
 
 # Rendering constants
@@ -83,11 +82,12 @@ class TubeLine:
 		return TubeLine(name=f"{self.name}{suffix}", stations=list(self.stations))
 
 
-def load_station_demands(csv_path: Path) -> Tuple[Dict[str, Station], torch.Tensor]:
+def load_station_demands(csv_path: Path) -> Tuple[Dict[str, Station], np.ndarray]:
 	"""Parse the filtered OD matrix and build a symmetric OD demand tensor."""
 
 	stations: Dict[str, Station] = {}
-	demand_tensor = torch.zeros_like(STATION_DISTANCES, device=DEVICE)
+	# demand tensor mirrors station distances shape; use float dtype for counts
+	demand_tensor = np.zeros_like(STATION_DISTANCES, dtype=float)
 
 	with csv_path.open(newline="", encoding="utf-8") as handle:
 		reader = csv.reader(handle)
@@ -136,7 +136,7 @@ def connection_cost(a: str, b: str, cost_per_connection: float) -> float:
 	idx_b = STATION_INDEX.get(b)
 	if idx_a is None or idx_b is None:
 		return 0.0
-	distance = float(STATION_DISTANCES_CPU[idx_a, idx_b].item())
+	distance = float(STATION_DISTANCES_CPU[idx_a, idx_b])
 	return  cost_per_connection * (distance ** 2)
 
 
@@ -263,36 +263,51 @@ def mutate_individual(
 
 ### Builds a copy of station distances where only connected lines are represented as fractions
 ### For n lines connecting a and b stations, the output tensor will have 1/n in (a,b) and (b,a)
-def build_connectivity_tensor(individual: Sequence[TubeLine]) -> torch.Tensor:
-	scalar = torch.zeros_like(STATION_DISTANCES, device=DEVICE)
+def build_connectivity_tensor(individual: Sequence[TubeLine]) -> np.ndarray:
+	# Count parallel connections between station pairs, then take reciprocal (1/n)
+	scalar = np.zeros_like(STATION_DISTANCES, dtype=float)
 	for line in individual:
 		for a, b in line.edges():
 			idx_a = STATION_INDEX.get(a)
 			idx_b = STATION_INDEX.get(b)
 			if idx_a is None or idx_b is None:
 				continue
-			scalar[idx_a, idx_b] += 1
-			scalar[idx_b, idx_a] += 1
-	scalar = scalar.reciprocal()
+			scalar[idx_a, idx_b] += 1.0
+			scalar[idx_b, idx_a] += 1.0
+	# reciprocal: 1/count; division by zero will produce inf (unconnected pairs)
+	with np.errstate(divide='ignore'):
+		scalar = 1.0 / scalar
 	return scalar
 
 ### Determines minimum path based on scaled distance using D'Esopo-Pape Algorithm
-def build_commute_distance_tensor(individual: Sequence[TubeLine]) -> torch.Tensor:
+def build_commute_distance_tensor(individual: Sequence[TubeLine]) -> np.ndarray:
 	connectivity = build_connectivity_tensor(individual)
-	scaled_connectivity = connectivity * STATION_DISTANCES
-	paths = torch.full_like(scaled_connectivity, float(DISCONNECT_MULTIPLIER), device=DEVICE)
+	scaled_connectivity = connectivity * np.power(10, STATION_DISTANCES, dtype=float)
+	paths = np.full_like(scaled_connectivity, float(DISCONNECT_MULTIPLIER), dtype=float)
 
-	for r, origin in enumerate(paths):
-		distance = [float("inf")] * len(origin)
-		distance[r] = 0
-		in_queue = [False] * len(origin)
+	## Build an adjacency list to change to O(E) from O(V^2) if used 2D traversal
+	adjacency_list = []
+	for i, row in enumerate(scaled_connectivity):
+		neighbors = []
+		for j, w in enumerate(row):
+			if math.isfinite(w):
+				neighbors.append((j, float(w)))
+		adjacency_list.append(neighbors)
+
+	for r in range(paths.shape[0]):
+		# shortest path search (D'Esopo-Pape style)
+		distance = [float("inf")] * paths.shape[1]
+		distance[r] = 0.0
+		in_queue = [False] * paths.shape[1]
 		queue = deque()
 		in_queue[r] = True
 		queue.append(r)
 		while queue:
 			a = queue.popleft()
 			in_queue[a] = False
-			for b, destination in enumerate(scaled_connectivity[a]):
+			row = scaled_connectivity[a]
+			for b, destination in adjacency_list[a]:
+				# destination may be inf for no direct connection
 				if distance[b] > destination + distance[a]:
 					distance[b] = destination + distance[a]
 					if not in_queue[b]:
@@ -304,7 +319,7 @@ def build_commute_distance_tensor(individual: Sequence[TubeLine]) -> torch.Tenso
 		for i, d in enumerate(distance):
 			if not math.isinf(d):
 				paths[r, i] = d
-	# np.savetxt("tensor.csv", paths.cpu().numpy(), delimiter=",")
+	# np.savetxt("tensor.csv", paths, delimiter=",")
 	return paths
 
 					
@@ -313,14 +328,14 @@ def build_commute_distance_tensor(individual: Sequence[TubeLine]) -> torch.Tenso
 
 
 
-def evaluate_network(individual: Sequence[TubeLine], demand_tensor: torch.Tensor):
+def evaluate_network(individual: Sequence[TubeLine], demand_tensor: np.ndarray):
+	# elementwise product of commute distances and demand
 	score_tensor = build_commute_distance_tensor(individual) * demand_tensor
 
-
-	# np.savetxt("station_distances.csv", STATION_DISTANCES.cpu().numpy(), delimiter=",", fmt="%.6f")
-	# np.savetxt("distance_scalar.csv", distance_scalar.cpu().numpy(), delimiter=",", fmt="%.6f")
-	# np.savetxt("demand_tensor.csv", demand_tensor.cpu().numpy(), delimiter=",", fmt="%.6f")
-	score = score_tensor.sum().item()
+	# np.savetxt("station_distances.csv", STATION_DISTANCES, delimiter=",", fmt="%.6f")
+	# np.savetxt("distance_scalar.csv", distance_scalar, delimiter=",", fmt="%.6f")
+	# np.savetxt("demand_tensor.csv", demand_tensor, delimiter=",", fmt="%.6f")
+	score = float(np.sum(score_tensor))
 	if not math.isfinite(score):
 		score = float("inf")
 	return (score,)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from typing import Dict, Sequence, Tuple
-import torch
+import numpy as np
 
 # Coordinates are intentionally schematic (not geographic) to resemble a tube-style map.
 # X increases eastward, Y increases northward.
@@ -106,10 +106,8 @@ for i, a in enumerate(STATION_ORDER):
         # Euclidean distance in schematic units, scaled to meters
         _dist_matrix[i][j] = math.hypot(xa - xb, ya - yb)
 
-# Exported constant: float32 PyTorch tensor of shape (N, N)
-# DEVICE = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
-DEVICE = "cpu"
-STATION_DISTANCES = torch.tensor(_dist_matrix, dtype=torch.float32, device=DEVICE)
+# Exported constant: float32 NumPy array of shape (N, N)
+STATION_DISTANCES = np.array(_dist_matrix, dtype=np.float32)
 
 
 def build_layout(stations: Sequence[str]) -> Dict[str, Tuple[float, float]]:
